@@ -1,5 +1,9 @@
 # Local models
 multilabel_model/
+
+# Local data
+hatespeech-data/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
