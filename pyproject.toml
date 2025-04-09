@@ -22,3 +22,6 @@ full = [
 notebook = [
     "ipykernel>=6.29.5",
 ]
+plot = [
+    "seaborn>=0.13.2",
+]

@@ -3,6 +3,7 @@ multilabel_model/
 
 # Local data
 hatespeech-data/
+profile_output*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
