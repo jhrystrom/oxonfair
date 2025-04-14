@@ -1,4 +1,6 @@
+import argparse
 import copy
+from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -31,6 +33,18 @@ from transformers.modeling_outputs import (
 
 import oxonfair
 from oxonfair import group_metrics as gm
+
+
+@dataclass
+class MetricChoice:
+    metric: gm.GroupMetric
+    threshold: float
+
+
+metric_choices = {
+    "equal_opportunity": MetricChoice(metric=gm.equal_opportunity, threshold=0.02),
+    "min_recall": MetricChoice(metric=gm.recall.min, threshold=0.75),
+}
 
 
 class FairnessMetrics(TypedDict):
@@ -91,7 +105,7 @@ def majority_vote(lists: list[list[bool]]) -> list[bool]:
 training_args = TrainingArguments(
     output_dir="multilabel_model",
     learning_rate=2e-5,
-    per_device_train_batch_size=128,
+    per_device_train_batch_size=64,
     per_device_eval_batch_size=256,
     fp16=True,
     num_train_epochs=3,
@@ -242,13 +256,15 @@ data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
 
 @profile
-def train():
-    K = 1
-    NUM_MEMBERS = 3
+def train(metric: str, num_iterations: int = 1, members: int = 3):
+    K = num_iterations
+    NUM_MEMBERS = members
     gss = GroupShuffleSplit(n_splits=K, train_size=0.8, random_state=110)
     all_features = combined.drop("target", "tid", "uid", "age", "ethnicity")
     all_labels = combined["target"]
     all_users = combined["uid"]
+
+    metric_choice = metric_choices[metric]
 
     test_metrics = []
     group_metrics = []
@@ -261,6 +277,11 @@ def train():
         train_groups = all_users[train_index]
         test_features = all_features[test_index]
         test_labels = all_labels[test_index]
+
+        test_dataset = create_dataset(
+            test_features,
+            test_labels,
+        ).map(preprocess_simple)
 
         # nested cross-validation
         # Run oxonfair on an outer
@@ -315,9 +336,14 @@ def train():
                 val_output.predictions,
                 groups=np.array(validation_dataset["gender"]),
             )
-            fpred.fit(gm.accuracy, gm.equal_opportunity, 0.02, grid_width=75)
+            fpred.fit(
+                gm.accuracy,
+                metric_choice.metric,
+                metric_choice.threshold,
+                grid_width=75,
+            )
             fpred.plot_frontier()
-            plt.savefig(f"../plots/equal_opportunity_val_{iteration}_{i}.png")
+            plt.savefig(f"../plots/{metric}_val_{iteration}_{i}.png")
             fair_network = copy.deepcopy(trainer)
             fair_network.model.classifier = fpred.merge_heads_pytorch(
                 fair_network.model.classifier
@@ -337,7 +363,19 @@ def train():
             group_metrics.append(group_performance)
             metrics.append(pd.concat([performance, fairness]))
             fair_ensemble.append(fair_network)
-            oxons.append(fpred)
+
+            # Evaluating on test set!
+            test_output = trainer.predict(test_dataset=test_dataset)
+            test_network = oxonfair.DeepDataDict(
+                test_labels.to_numpy(),
+                test_output.predictions,
+                np.array(test_features["gender"]),
+            )
+
+            plt.clf()
+            fpred.plot_frontier(data=test_network)
+            plt.savefig(f"../plots/{metric}_test_{iteration}_{i}.png")
+            plt.clf()
 
         pd.concat(group_metrics).to_csv(
             f"../hatespeech-data/group_metrics_iteration{iteration}.csv", index=False
@@ -345,10 +383,6 @@ def train():
 
         all_metrics.append(pd.concat(metrics).assign(iteration=iteration))
         logger.info("Done training ensemble! Evaluating on test set")
-        test_dataset = create_dataset(
-            test_features,
-            test_labels,
-        ).map(preprocess_simple)
 
         logger.debug("Evaluating ensemble...")
         ensemble_preds = ensemble_predict(
@@ -377,11 +411,13 @@ def train():
 
 
 if __name__ == "__main__":
-    test_metrics, all_metrics = train()
-    current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    test_metrics.to_csv(
-        f"../hatespeech-data/test_metrics-{current_time}.csv", index=False
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--metric", type=str, choices=list(metric_choices), default="equal_opportunity"
     )
-    all_metrics.to_csv(
-        f"../hatespeech-data/validation_metrics-{current_time}.csv", index=False
+    parser.add_argument("--iterations", type=int, default=1)
+    parser.add_argument("--members", type=int, default=1)
+    args = parser.parse_args()
+    test_metrics, all_metrics = train(
+        metric=args.metric, num_iterations=args.iterations, members=args.members
     )
