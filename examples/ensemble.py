@@ -3,6 +3,7 @@ import copy
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
+from itertools import combinations
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -125,7 +126,76 @@ def convert_score(score: float, threshold: float = 0.5) -> bool:
     return score > threshold
 
 
+def calculate_disagreement_rates(ensemble_preds):
+    """
+    Calculate the disagreement rate for all pairs of predictions in an ensemble.
+
+    Args:
+        ensemble_preds: A list of lists where each sublist contains the predictions
+                        for one instance across all predictors.
+
+    Returns:
+        A numpy array containing the disagreement rate for each pair of predictors.
+    """
+    # Convert to numpy array for easier manipulation
+    preds = np.array(ensemble_preds).T  # Transpose to get predictors as rows
+
+    n_predictors = preds.shape[0]
+    n_pairs = n_predictors * (n_predictors - 1) // 2  # Number of unique pairs
+
+    # Initialize array to store disagreement rates
+    disagreement_rates = np.zeros(n_pairs)
+
+    # Calculate disagreement rate for each pair of predictors
+    for pair_idx, (i, j) in enumerate(combinations(range(n_predictors), 2)):
+        # Count instances where predictions differ
+        disagreements = np.sum(preds[i] != preds[j])
+        # Calculate disagreement rate
+        disagreement_rates[pair_idx] = disagreements / preds.shape[1]
+
+    return disagreement_rates
+
+
+def calculate_error_rate_avg(
+    ensemble_preds: list[list[bool]], y_true: list[bool | int]
+) -> float:
+    num_members = len(ensemble_preds[0])
+    total_error = 0
+    for i in range(num_members):
+        member_preds = [pred[i] for pred in ensemble_preds]
+        member_error = 1 - accuracy_score(y_true=y_true, y_pred=member_preds)
+        total_error += member_error
+    return total_error / num_members
+
+
+def calculate_der(preds: list[list[bool]], y_true: list[bool]) -> float:
+    disagreement = calculate_disagreement_rates(preds).mean()
+    average_error = calculate_error_rate_avg(ensemble_preds=preds, y_true=y_true)
+    return disagreement / average_error
+
+
+def calculate_der_groups(
+    preds: list[list[bool]], y_true: list[bool], groups: list[bool]
+) -> tuple[float, float]:
+    group_mask = np.array(groups)
+    ders = [0, 0]
+    for group in range(2):
+        mask_variable = group_mask == group
+        y_true_group = np.array(y_true)[mask_variable]
+        group_indices = np.where(mask_variable)[0]
+        group_preds = [pred for i, pred in enumerate(preds) if i in group_indices]
+        assert len(group_preds) == y_true_group.shape[0]
+        group_der = calculate_der(preds=group_preds, y_true=y_true_group)
+        ders[group] += group_der
+    return ders[0], ders[1]
+
+
 def aggregate_scores(scores: list[list[dict]], threshold: float = 0.5) -> list[bool]:
+    final_preds = reformat_scores(scores, threshold)
+    return majority_vote(final_preds)
+
+
+def reformat_scores(scores: list[list[dict]], threshold: float = 0.5):
     num_preds = len(scores[0])
     # Convert to list[(pred0, pred0, pred0), (pred1, ...]
     final_preds = []
@@ -135,7 +205,7 @@ def aggregate_scores(scores: list[list[dict]], threshold: float = 0.5) -> list[b
             score_dict = score_list[pred_index]
             pred_list.append(convert_score(score_dict["score"], threshold=threshold))
         final_preds.append(pred_list)
-    return majority_vote(final_preds)
+    return final_preds
 
 
 def max_index_by_key(lst: list[dict], key: str = "score"):
@@ -147,6 +217,13 @@ def max_index_by_key(lst: list[dict], key: str = "score"):
 def ensemble_predict(
     texts: list[str], ensemble: list[Trainer], batch_size: int | None = None
 ) -> list[int]:
+    preds = ensemble_predict_raw(texts, ensemble, batch_size)
+    return aggregate_scores(preds)
+
+
+def ensemble_predict_raw(
+    texts: list[str], ensemble: list[Trainer], batch_size: int | None = None
+):
     device = ensemble[0].model.device  # Get device from first model
     pipes = [
         TextClassificationPipeline(
@@ -166,7 +243,7 @@ def ensemble_predict(
             for output in pipe(texts, batch_size=batch_size):
                 inner_preds.append(output)
             preds.append(inner_preds)
-    return aggregate_scores(preds)
+    return preds
 
 
 def get_full_data():
@@ -385,9 +462,23 @@ def train(metric: str, num_iterations: int = 1, members: int = 3):
         logger.info("Done training ensemble! Evaluating on test set")
 
         logger.debug("Evaluating ensemble...")
-        ensemble_preds = ensemble_predict(
+        raw_preds = ensemble_predict_raw(
             texts=test_dataset["text"], ensemble=fair_ensemble, batch_size=256
         )
+        formatted_preds = reformat_scores(raw_preds)
+        ensemble_der_total = calculate_der(
+            preds=formatted_preds, y_true=test_labels.to_list()
+        )
+        der0, der1 = calculate_der_groups(
+            preds=formatted_preds,
+            y_true=test_labels.to_list(),
+            groups=test_features["gender"].to_list(),
+        )
+        logger.info(f"{ensemble_der_total=}")
+        logger.info(f"{der0=} and {der1=}")
+
+        ensemble_preds = aggregate_scores(raw_preds)
+
         ensemble_metrics = calculate_metrics(
             test_groups=test_features["gender"],
             test_labels=test_labels,
