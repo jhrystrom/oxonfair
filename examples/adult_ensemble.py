@@ -16,7 +16,8 @@ from fairlearn.metrics import (
 )
 from loguru import logger
 from sklearn.metrics import accuracy_score, precision_score, recall_score
-from sklearn.model_selection import KFold
+from sklearn.model_selection import StratifiedKFold
+from tqdm import tqdm
 
 from oxonfair import FairPredictor, dataset_loader
 from oxonfair import group_metrics as gm
@@ -35,13 +36,18 @@ def calculate_metrics(
     test_labels: np.ndarray,
     predictions: list[str] | np.ndarray,
 ) -> FairnessMetrics:
+    metric_frame = MetricFrame(
+        metrics={"recall": recall_score},
+        y_true=test_labels,
+        y_pred=predictions,
+        sensitive_features=test_groups,
+    )
+    recall_by_group = {
+        f"recall_group_{key}": value
+        for key, value in metric_frame.by_group.to_dict()["recall"].items()
+    }
     return {
-        "min_recall": MetricFrame(
-            metrics={"recall": recall_score},
-            y_true=test_labels,
-            y_pred=predictions,
-            sensitive_features=test_groups,
-        ).group_min()["recall"],
+        "min_recall": metric_frame.group_min()["recall"],
         "equal_opportunity": equal_opportunity_difference(
             y_true=test_labels,
             y_pred=predictions,
@@ -53,6 +59,7 @@ def calculate_metrics(
         "demographic_parity": demographic_parity_difference(
             y_true=test_labels, y_pred=predictions, sensitive_features=test_groups
         ),
+        **recall_by_group,
     }
 
 
@@ -194,8 +201,7 @@ def train_ensemble(
         "groups": np.concatenate([train_data["groups"], val_data["groups"]]),
     }
 
-    # Use GroupShuffleSplit to create stratified folds
-    gss = KFold(n_splits=num_members, random_state=42, shuffle=True)
+    gss = StratifiedKFold(n_splits=num_members, random_state=42, shuffle=True)
     splits = list(gss.split(combined_data["data"], combined_data["target"]))
 
     # Train ensemble members on different folds
@@ -273,9 +279,7 @@ def train_ensemble(
 
     # Get predictions from all ensemble members
     ensemble_preds = []
-
     test_predictions_data = {"data": test_data["data"], "target": test_data["target"]}
-
     for model in ensemble_models:
         preds = model.predict(test_predictions_data)
         ensemble_preds.append(preds)
@@ -283,8 +287,6 @@ def train_ensemble(
     # Calculate ensemble metrics
     final_preds = aggregate_scores(ensemble_preds)
     formatted_preds = consolidate_predictions(ensemble_preds)
-    logger.debug(f"Final predictions: {np.array(final_preds).shape=}")
-    logger.debug(f"Target shape: {np.array(test_data['target']).shape=}")
 
     ensemble_test_metrics = calculate_metrics(
         test_groups=test_data["groups"],
@@ -340,13 +342,20 @@ def merge_ethnicity_groups(data, groups_to_merge, merge_name=" Other"):
     return data_copy
 
 
-def main(metric: str = "equal_opportunity", members: int = 3, threshold: float = 0.02):
+def main(
+    metric: str = "equal_opportunity",
+    members: int = 3,
+    threshold: float = 0.02,
+    iterations: int = 1,
+):
     # Set up output directory
     output_dir = Path("./ensemble_results")
     output_dir.mkdir(exist_ok=True)
 
     # Load adult dataset with ethnicity as sensitive attribute
     logger.info("Loading Adult dataset with ethnicity as sensitive attribute")
+
+    # Analyze original ethnicity distribution
     train_data, val_data, test_data = dataset_loader.adult(
         "race",
         train_proportion=0.6,
@@ -354,8 +363,6 @@ def main(metric: str = "equal_opportunity", members: int = 3, threshold: float =
         seperate_groups=True,
         seed=42,
     )
-
-    # Analyze original ethnicity distribution
     ethnicity_dist = pd.Series(train_data["groups"]).value_counts()
     logger.info(f"Original ethnicity distribution: {ethnicity_dist}")
 
@@ -392,111 +399,130 @@ def main(metric: str = "equal_opportunity", members: int = 3, threshold: float =
         logger.info(
             f"Training with grouping: {grouping['name']} - {grouping['description']}"
         )
-
-        # Merge groups if needed
-        if grouping["merge"]:
-            train_data_merged = merge_ethnicity_groups(train_data, grouping["merge"])
-            val_data_merged = merge_ethnicity_groups(val_data, grouping["merge"])
-            test_data_merged = merge_ethnicity_groups(test_data, grouping["merge"])
-
-            # Log the new group distribution
-            merged_dist = pd.Series(train_data_merged["groups"]).value_counts()
-            logger.info(f"Merged ethnicity distribution: {merged_dist}")
-        else:
-            train_data_merged = train_data
-            val_data_merged = val_data
-            test_data_merged = test_data
-
-        # Train ensemble
-        ensemble_metrics, individual_metrics, ensemble_models = train_ensemble(
-            train_data_merged,
-            val_data_merged,
-            test_data_merged,
-            num_members=members,
-            metric=metric,
-            threshold=threshold,
-        )
-
-        # Add grouping info to metrics
-        ensemble_metrics["grouping"] = grouping["name"]
-        ensemble_metrics["description"] = grouping["description"]
-        ensemble_metrics["num_groups"] = len(np.unique(test_data_merged["groups"]))
-
-        # Save to results
-        results.append(ensemble_metrics)
-
-        # Save individual metrics
-        indiv_df = pd.DataFrame(individual_metrics)
-        indiv_df["grouping"] = grouping["name"]
-        indiv_df.to_csv(
-            output_dir / f"individual_metrics_{grouping['name']}.csv", index=False
-        )
-
-        # Plot group-specific metrics
-        group_metrics = {
-            k: v for k, v in ensemble_metrics.items() if k.startswith("recall_group_")
-        }
-        if group_metrics:
-            plt.figure(figsize=(10, 6))
-            plt.bar(group_metrics.keys(), group_metrics.values())
-            plt.title(f"Group Recall - {grouping['name']}")
-            plt.xticks(rotation=45, ha="right")
-            plt.ylim(0, 1)
-            plt.tight_layout()
-            plt.savefig(output_dir / f"group_recall_{grouping['name']}.png")
-            plt.close()
-
-        test_predictions_data = {
-            "data": test_data_merged["data"],
-            "target": test_data_merged["target"],
-        }
-        probas = [
-            ensemble_model.predict_proba(test_predictions_data)[:, 1]
-            for ensemble_model in ensemble_models
-        ]
-        prediction_thresholds = np.linspace(0, 1, 100)
-
-        all_metrics = []
-        for pred_threshold in prediction_thresholds:
-            preds = aggregate_probas(probas, threshold=pred_threshold)
-            metrics = calculate_metrics(
-                test_groups=test_data_merged["groups"],
-                test_labels=test_data_merged["target"],
-                predictions=preds,
+        for iteration in tqdm(range(iterations), desc="Iterations", unit="iteration"):
+            train_data, val_data, test_data = dataset_loader.adult(
+                "race",
+                train_proportion=0.6,
+                test_proportion=0.2,  # Remaining 0.2 goes to validation
+                seperate_groups=True,
+                seed=42,
             )
-            metrics["threshold"] = pred_threshold
-            all_metrics.append(metrics)
 
-        single_proba = probas[:1]
-        single_metrics = []
-        for pred_threshold in prediction_thresholds:
-            preds = aggregate_probas(single_proba, threshold=pred_threshold)
-            metrics = calculate_metrics(
-                test_groups=test_data_merged["groups"],
-                test_labels=test_data_merged["target"],
-                predictions=preds,
+            # Merge groups if needed
+            if grouping["merge"]:
+                train_data_merged = merge_ethnicity_groups(
+                    train_data, grouping["merge"]
+                )
+                val_data_merged = merge_ethnicity_groups(val_data, grouping["merge"])
+                test_data_merged = merge_ethnicity_groups(test_data, grouping["merge"])
+
+                # Log the new group distribution
+                merged_dist = pd.Series(train_data_merged["groups"]).value_counts()
+                logger.info(f"Merged ethnicity distribution: {merged_dist}")
+            else:
+                train_data_merged = train_data
+                val_data_merged = val_data
+                test_data_merged = test_data
+
+            # Train ensemble
+            ensemble_metrics, individual_metrics, ensemble_models = train_ensemble(
+                train_data_merged,
+                val_data_merged,
+                test_data_merged,
+                num_members=members,
+                metric=metric,
+                threshold=threshold,
             )
-            metrics["threshold"] = pred_threshold
-            single_metrics.append(metrics)
+
+            # Add grouping info to metrics
+            ensemble_metrics["grouping"] = grouping["name"]
+            ensemble_metrics["description"] = grouping["description"]
+            ensemble_metrics["num_groups"] = len(np.unique(test_data_merged["groups"]))
+            ensemble_metrics["iteration"] = iteration
+
+            # Save to results
+            results.append(ensemble_metrics)
+
+            # Save individual metrics
+            indiv_df = pd.DataFrame(individual_metrics)
+            indiv_df["grouping"] = grouping["name"]
+            indiv_df["iteration"] = iteration
+            indiv_df.to_csv(
+                output_dir / f"individual_metrics_{grouping['name']}-i{iteration}.csv",
+                index=False,
+            )
+
+            # Plot group-specific metrics
+            group_metrics = {
+                k: v
+                for k, v in ensemble_metrics.items()
+                if k.startswith("recall_group_")
+            }
+            if group_metrics:
+                plt.figure(figsize=(10, 6))
+                plt.bar(group_metrics.keys(), group_metrics.values())
+                plt.title(f"Group Recall - {grouping['name']}")
+                plt.xticks(rotation=45, ha="right")
+                plt.ylim(0, 1)
+                plt.tight_layout()
+                plt.savefig(output_dir / f"group_recall_{grouping['name']}.png")
+                plt.close()
+
+            test_predictions_data = {
+                "data": test_data_merged["data"],
+                "target": test_data_merged["target"],
+            }
+            probas = [
+                ensemble_model.predict_proba(test_predictions_data)[:, 1]
+                for ensemble_model in ensemble_models
+            ]
+            prediction_thresholds = np.linspace(0, 1, 100)
+
+            all_metrics = []
+            for pred_threshold in prediction_thresholds:
+                preds = aggregate_probas(probas, threshold=pred_threshold)
+                metrics = calculate_metrics(
+                    test_groups=test_data_merged["groups"],
+                    test_labels=test_data_merged["target"],
+                    predictions=preds,
+                )
+                metrics["threshold"] = pred_threshold
+                metrics["iteration"] = iteration
+                all_metrics.append(metrics)
+
+            single_proba = probas[:1]
+            single_metrics = []
+            for pred_threshold in prediction_thresholds:
+                preds = aggregate_probas(single_proba, threshold=pred_threshold)
+                metrics = calculate_metrics(
+                    test_groups=test_data_merged["groups"],
+                    test_labels=test_data_merged["target"],
+                    predictions=preds,
+                )
+                metrics["threshold"] = pred_threshold
+                metrics["iteration"] = iteration
+                single_metrics.append(metrics)
 
         pd.DataFrame(single_metrics).to_csv(
             output_dir / f"single_threshold_metrics_{grouping['name']}.csv", index=False
         )
 
         pd.DataFrame(all_metrics).to_csv(
-            output_dir / f"threshold_metrics_{grouping['name']}-n{members}.csv",
+            output_dir
+            / f"threshold_metrics_{grouping['name']}-n{members}-i{iterations}.csv",
             index=False,
         )
 
     # Save overall results
     results_df = pd.DataFrame(results)
-    results_df.to_csv(output_dir / "ensemble_results.csv", index=False)
+    results_df.to_csv(
+        output_dir / f"ensemble_results-n{members}-i{iterations}.csv", index=False
+    )
 
     # Create summary plot
     plt.figure(figsize=(12, 8))
 
     # Plot accuracy vs fairness
-    logger.debug(f"{results_df.columns=}")
     x = results_df["accuracy"]
     y = results_df[f"{metric}"]
     labels = results_df["grouping"]
@@ -523,6 +549,9 @@ if __name__ == "__main__":
         "--members", type=int, default=3, help="Number of ensemble members"
     )
     parser.add_argument(
+        "--iterations", type=int, default=1, help="Number of iterations to run"
+    )
+    parser.add_argument(
         "--metric",
         type=str,
         choices=["demographic_parity", "equal_opportunity", "min_recall"],
@@ -533,4 +562,9 @@ if __name__ == "__main__":
         "--threshold", type=float, default=0.02, help="Fairness threshold"
     )
     args = parser.parse_args()
-    main(members=args.members, metric=args.metric, threshold=args.threshold)
+    main(
+        members=args.members,
+        metric=args.metric,
+        threshold=args.threshold,
+        iterations=args.iterations,
+    )
