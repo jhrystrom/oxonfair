@@ -399,13 +399,15 @@ def main(
         logger.info(
             f"Training with grouping: {grouping['name']} - {grouping['description']}"
         )
+        all_metrics = []
+        single_metrics = []
         for iteration in tqdm(range(iterations), desc="Iterations", unit="iteration"):
             train_data, val_data, test_data = dataset_loader.adult(
                 "race",
                 train_proportion=0.6,
                 test_proportion=0.2,  # Remaining 0.2 goes to validation
                 seperate_groups=True,
-                seed=42,
+                seed=42 + iteration,
             )
 
             # Merge groups if needed
@@ -478,7 +480,6 @@ def main(
             ]
             prediction_thresholds = np.linspace(0, 1, 100)
 
-            all_metrics = []
             for pred_threshold in prediction_thresholds:
                 preds = aggregate_probas(probas, threshold=pred_threshold)
                 metrics = calculate_metrics(
@@ -491,7 +492,6 @@ def main(
                 all_metrics.append(metrics)
 
             single_proba = probas[:1]
-            single_metrics = []
             for pred_threshold in prediction_thresholds:
                 preds = aggregate_probas(single_proba, threshold=pred_threshold)
                 metrics = calculate_metrics(
@@ -504,7 +504,9 @@ def main(
                 single_metrics.append(metrics)
 
         pd.DataFrame(single_metrics).to_csv(
-            output_dir / f"single_threshold_metrics_{grouping['name']}.csv", index=False
+            output_dir
+            / f"single_threshold_metrics_{grouping['name']}-i{iterations}.csv",
+            index=False,
         )
 
         pd.DataFrame(all_metrics).to_csv(
