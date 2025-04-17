@@ -9,7 +9,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from fairlearn.metrics import demographic_parity_difference
+from fairlearn.metrics import (
+    MetricFrame,
+    demographic_parity_difference,
+    equal_opportunity_difference,
+)
 from loguru import logger
 from sklearn.metrics import accuracy_score, precision_score, recall_score
 from sklearn.model_selection import KFold
@@ -31,18 +35,18 @@ def calculate_metrics(
     test_labels: np.ndarray,
     predictions: list[str] | np.ndarray,
 ) -> FairnessMetrics:
-    groups = test_groups
-    preds0 = np.array(predictions)[groups == " White"]
-    preds1 = np.array(predictions)[groups != " White"]
-    labels0 = test_labels[groups == " White"]
-    labels1 = np.array(test_labels)[groups != " White"]
-    recall1 = recall_score(y_true=labels1, y_pred=preds1)
-    recall0 = recall_score(y_true=labels0, y_pred=preds0)
-    min_recall = min(recall0, recall1)
-    equal_opportunity = abs(recall1 - recall0)
     return {
-        "min_recall": min_recall,
-        "equal_opportunity": equal_opportunity,
+        "min_recall": MetricFrame(
+            metrics={"recall": recall_score},
+            y_true=test_labels,
+            y_pred=predictions,
+            sensitive_features=test_groups,
+        ).group_min()["recall"],
+        "equal_opportunity": equal_opportunity_difference(
+            y_true=test_labels,
+            y_pred=predictions,
+            sensitive_features=test_groups,
+        ),
         "accuracy": accuracy_score(y_true=test_labels, y_pred=predictions),
         "precision": precision_score(y_true=test_labels, y_pred=predictions),
         "recall": recall_score(y_true=test_labels, y_pred=predictions),
@@ -141,6 +145,12 @@ def aggregate_scores(scores: list[np.ndarray]) -> list[bool]:
     return majority_vote(final_preds)
 
 
+def aggregate_probas(probas: list[np.ndarray], threshold: float = 0.5) -> np.ndarray:
+    combined = np.vstack(probas).T
+    num_members = combined.shape[1]
+    return (combined > threshold).sum(axis=1) > num_members / 2
+
+
 def consolidate_predictions(scores):
     num_preds = len(scores[0])
     # Convert to list[(pred0, pred0, pred0), (pred1, ...]
@@ -215,6 +225,8 @@ def train_ensemble(
             fair_predictor.fit(gm.accuracy, gm.demographic_parity, threshold)
         elif metric == "equal_opportunity":
             fair_predictor.fit(gm.accuracy, gm.equal_opportunity, threshold)
+        elif metric == "min_recall":
+            fair_predictor.fit(gm.accuracy, gm.recall.min, threshold)
         else:
             raise ValueError(f"Unsupported metric: {metric}")
 
@@ -250,7 +262,7 @@ def train_ensemble(
         plt.figure(figsize=(10, 6))
         fair_predictor.plot_frontier()
         plt.title(f"Fairness Frontier - Member {member+1}")
-        plt.savefig(f"fairness_frontier_member_{member+1}.png")
+        plt.savefig(f"fairness_frontier_member_{member+1}-{metric}.png")
         plt.close()
 
     end_time = time.perf_counter()
@@ -375,7 +387,7 @@ def main(metric: str = "equal_opportunity", members: int = 3, threshold: float =
 
     # Train ensemble for each grouping
     for grouping in groupings:
-        if grouping["name"] != "2groups":
+        if grouping["name"] != "original":
             continue
         logger.info(
             f"Training with grouping: {grouping['name']} - {grouping['description']}"
@@ -434,6 +446,48 @@ def main(metric: str = "equal_opportunity", members: int = 3, threshold: float =
             plt.savefig(output_dir / f"group_recall_{grouping['name']}.png")
             plt.close()
 
+        test_predictions_data = {
+            "data": test_data_merged["data"],
+            "target": test_data_merged["target"],
+        }
+        probas = [
+            ensemble_model.predict_proba(test_predictions_data)[:, 1]
+            for ensemble_model in ensemble_models
+        ]
+        prediction_thresholds = np.linspace(0, 1, 100)
+
+        all_metrics = []
+        for pred_threshold in prediction_thresholds:
+            preds = aggregate_probas(probas, threshold=pred_threshold)
+            metrics = calculate_metrics(
+                test_groups=test_data_merged["groups"],
+                test_labels=test_data_merged["target"],
+                predictions=preds,
+            )
+            metrics["threshold"] = pred_threshold
+            all_metrics.append(metrics)
+
+        single_proba = probas[:1]
+        single_metrics = []
+        for pred_threshold in prediction_thresholds:
+            preds = aggregate_probas(single_proba, threshold=pred_threshold)
+            metrics = calculate_metrics(
+                test_groups=test_data_merged["groups"],
+                test_labels=test_data_merged["target"],
+                predictions=preds,
+            )
+            metrics["threshold"] = pred_threshold
+            single_metrics.append(metrics)
+
+        pd.DataFrame(single_metrics).to_csv(
+            output_dir / f"single_threshold_metrics_{grouping['name']}.csv", index=False
+        )
+
+        pd.DataFrame(all_metrics).to_csv(
+            output_dir / f"threshold_metrics_{grouping['name']}-n{members}.csv",
+            index=False,
+        )
+
     # Save overall results
     results_df = pd.DataFrame(results)
     results_df.to_csv(output_dir / "ensemble_results.csv", index=False)
@@ -471,7 +525,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--metric",
         type=str,
-        choices=["demographic_parity", "equal_opportunity"],
+        choices=["demographic_parity", "equal_opportunity", "min_recall"],
         default="demographic_parity",
         help="Fairness metric to optimize",
     )
