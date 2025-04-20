@@ -30,8 +30,8 @@ datasets = {
 
 class FairnessMetrics(TypedDict):
     equal_opportunity: float
-    min_recall: float
     accuracy: float
+    min_recall: float
     precision: float
     recall: float
 
@@ -238,11 +238,15 @@ def train_ensemble(
         # Apply fairness constraints
         fair_predictor = FairPredictor(base_model, fold_val_data)
         if metric == "demographic_parity":
-            fair_predictor.fit(gm.accuracy, gm.demographic_parity, threshold)
+            fair_predictor.fit(
+                gm.accuracy, gm.demographic_parity, threshold, recompute=False
+            )
         elif metric == "equal_opportunity":
-            fair_predictor.fit(gm.accuracy, gm.equal_opportunity, threshold)
+            fair_predictor.fit(
+                gm.accuracy, gm.equal_opportunity, threshold, recompute=False
+            )
         elif metric == "min_recall":
-            fair_predictor.fit(gm.accuracy, gm.recall.min, threshold)
+            fair_predictor.fit(gm.accuracy, gm.recall.min, threshold, recompute=False)
         else:
             raise ValueError(f"Unsupported metric: {metric}")
         logger.debug("OxonFair fitted")
@@ -460,7 +464,7 @@ def main(
             metrics["iteration"] = iteration
             single_metrics.append(metrics)
     pd.DataFrame(single_metrics).to_csv(
-        output_dir / f"single_threshold_metrics_{dataset}-i{iterations}.csv",
+        output_dir / f"single_threshold_metrics_{dataset}-n{members}-i{iterations}.csv",
         index=False,
     )
     pd.DataFrame(all_metrics).to_csv(
