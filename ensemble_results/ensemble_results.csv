@@ -1,2 +1,2 @@
-min_recall,equal_opportunity,accuracy,precision,recall,demographic_parity,model_type,num_members,training_time,der,der_group_ Other,der_group_ White,grouping,description,num_groups
-0.6018518518518519,0.08650269788883647,0.8695741195741196,0.7510628247520076,0.6803594351732991,0.11471321189687643,ensemble,3,1.7480370420962572,0.42777496198682213,0.23255813953488375,0.33433734939759036,2groups,2 ethnicity groups (White vs. Others),2
+min_recall,equal_opportunity,accuracy,precision,recall,demographic_parity,model_type,num_members,training_time,der,der_group_ Amer-Indian-Eskimo,der_group_ Asian-Pac-Islander,der_group_ Black,der_group_ Other,der_group_ White,grouping,description,num_groups
+0.7272727272727273,0.2727272727272727,0.7287059787059788,0.46734821614855,0.9584937954642704,0.25816322984007817,ensemble,5,160.23827716708183,0.8974158739173649,1.125,1.4,1.4050632911392404,1.6666666666666672,1.4862298195631531,original,Original 5 ethnicity groups,5

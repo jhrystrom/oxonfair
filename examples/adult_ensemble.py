@@ -1,13 +1,16 @@
 import argparse
 import copy
+import random
 import time
 from itertools import combinations
 from pathlib import Path
 from typing import TypedDict
 
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+from catboost import CatBoostClassifier
 from fairlearn.metrics import (
     MetricFrame,
     demographic_parity_difference,
@@ -35,6 +38,40 @@ class FairnessMetrics(TypedDict):
     min_recall: float
     precision: float
     recall: float
+
+
+Model = (
+    xgb.XGBClassifier | lgb.LGBMClassifier | CatBoostClassifier | RandomForestClassifier
+)
+
+
+def make_random_model(rng: random.Random) -> Model:
+    choice = rng.choice(["xgb", "lgbm", "cat", "rf"])
+
+    if choice == "xgb":
+        return xgb.XGBClassifier(
+            max_depth=rng.choice([4, 6]),
+            subsample=rng.choice([0.6, 0.8, 1.0]),
+            random_state=rng.randint(0, 9999),
+        )
+    if choice == "lgbm":
+        return lgb.LGBMClassifier(
+            num_leaves=rng.choice([31, 63]),
+            feature_fraction=rng.choice([0.6, 0.8, 1.0]),
+            random_state=rng.randint(0, 9999),
+        )
+    if choice == "cat":
+        return CatBoostClassifier(
+            depth=rng.choice([4, 6]),
+            rsm=rng.choice([0.6, 0.8, 1.0]),
+            verbose=False,
+            random_state=rng.randint(0, 9999),
+        )
+    return RandomForestClassifier(
+        max_depth=rng.choice([None, 10]),
+        max_features=rng.choice([0.5, 0.7, 1.0]),
+        random_state=rng.randint(0, 9999),
+    )
 
 
 def calculate_metrics(
@@ -187,6 +224,7 @@ def train_ensemble(
     val_data,
     test_data,
     num_members=3,
+    iteration_number: int = 0,
     metric="demographic_parity",
     threshold=0.02,
 ):
@@ -233,11 +271,9 @@ def train_ensemble(
         }
 
         # Train the base model (XGBoost)
-        base_model = (
-            xgb.XGBClassifier(random_state=42 + member)
-            if member % 2 == 0
-            else RandomForestClassifier(random_state=42 + member)
-        )
+        base_model = make_random_model(random.Random(42 + member + iteration_number))
+        model_name = base_model.__class__.__name__
+        logger.debug(f"Base model: {model_name}")
         logger.debug("Ftting base model")
         base_model.fit(X=fold_train_data["data"], y=fold_train_data["target"])
         logger.debug("Base model fitted")
@@ -265,6 +301,7 @@ def train_ensemble(
         )
 
         val_metrics["member"] = member
+        val_metrics["model_name"] = model_name
         val_metrics["split"] = "validation"
         individual_metrics.append(val_metrics)
 
@@ -421,6 +458,7 @@ def main(
             val_data,
             test_data,
             num_members=members,
+            iteration_number=iteration,
             metric=metric,
             threshold=threshold,
         )
