@@ -5,7 +5,6 @@ from itertools import combinations
 from pathlib import Path
 from typing import TypedDict
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import xgboost as xgb
@@ -15,8 +14,10 @@ from fairlearn.metrics import (
     equal_opportunity_difference,
 )
 from loguru import logger
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.frozen import FrozenEstimator
 from sklearn.metrics import accuracy_score, precision_score, recall_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import FixedThresholdClassifier, StratifiedKFold
 from tqdm import tqdm
 
 from oxonfair import FairPredictor, dataset_loader
@@ -211,6 +212,9 @@ def train_ensemble(
     gss = StratifiedKFold(n_splits=num_members, random_state=42, shuffle=True)
     splits = list(gss.split(combined_data["data"], combined_data["target"]))
 
+    val_predictions = []
+    val_labels = []
+    val_groups = []
     # Train ensemble members on different folds
     for member, (train_idx, val_idx) in enumerate(splits):
         logger.info(f"Training ensemble member {member+1}/{num_members}")
@@ -229,30 +233,17 @@ def train_ensemble(
         }
 
         # Train the base model (XGBoost)
-        base_model = xgb.XGBClassifier(random_state=42 + member)
+        base_model = (
+            xgb.XGBClassifier(random_state=42 + member)
+            if member % 2 == 0
+            else RandomForestClassifier(random_state=42 + member)
+        )
         logger.debug("Ftting base model")
         base_model.fit(X=fold_train_data["data"], y=fold_train_data["target"])
         logger.debug("Base model fitted")
 
-        logger.debug("Fitting OxonFair")
-        # Apply fairness constraints
-        fair_predictor = FairPredictor(base_model, fold_val_data)
-        if metric == "demographic_parity":
-            fair_predictor.fit(
-                gm.accuracy, gm.demographic_parity, threshold, recompute=False
-            )
-        elif metric == "equal_opportunity":
-            fair_predictor.fit(
-                gm.accuracy, gm.equal_opportunity, threshold, recompute=False
-            )
-        elif metric == "min_recall":
-            fair_predictor.fit(gm.accuracy, gm.recall.min, threshold, recompute=False)
-        else:
-            raise ValueError(f"Unsupported metric: {metric}")
-        logger.debug("OxonFair fitted")
-
         # Save the model
-        ensemble_models.append(fair_predictor)
+        ensemble_models.append(base_model)
 
         # Evaluate on validation set
         val_predictions_data = {
@@ -263,28 +254,46 @@ def train_ensemble(
             "groups": fold_val_data["groups"],
         }
 
-        val_preds = fair_predictor.predict(val_predictions_data)
+        val_preds = base_model.predict_proba(val_predictions_data["data"])
+        val_labels.append(fold_val_data["target"])
+        val_predictions.append(val_preds)
+        val_groups.append(fold_val_data["groups"])
         val_metrics = calculate_metrics(
             test_groups=fold_val_data["groups"],
             test_labels=fold_val_data["target"],
-            predictions=val_preds,
+            predictions=base_model.predict(val_predictions_data["data"]),
         )
-
-        fair_predictor.evaluate_fairness()
-        fairness = fair_predictor.evaluate_fairness(
-            metrics=gm.default_fairness_measures | {"min_recall": gm.recall.min}
-        ).assign(classifier=member, metric_type="fairness")
 
         val_metrics["member"] = member
         val_metrics["split"] = "validation"
         individual_metrics.append(val_metrics)
 
-        # Plot fairness frontier
-        plt.figure(figsize=(10, 6))
-        fair_predictor.plot_frontier()
-        plt.title(f"Fairness Frontier - Member {member+1}")
-        plt.savefig(f"fairness_frontier_member_{member+1}-{metric}.png")
-        plt.close()
+    predictions = np.concatenate(val_predictions)
+
+    combined_fair_predictor = FairPredictor(
+        predictor=None,
+        validation_data={
+            "data": predictions,
+            "target": np.concatenate(val_labels),
+            "groups": np.concatenate(val_groups),
+        },
+    )
+
+    if metric == "min_recall":
+        combined_fair_predictor.fit(gm.accuracy, gm.recall.min, threshold)
+    elif metric == "demographic_parity":
+        combined_fair_predictor.fit(gm.accuracy, gm.demographic_parity, threshold)
+    elif metric == "equal_opportunity":
+        combined_fair_predictor.fit(gm.accuracy, gm.equal_opportunity, threshold)
+    else:
+        raise ValueError(f"Unknown metric: {metric}")
+
+    frozen_ensemble = [
+        FixedThresholdClassifier(
+            FrozenEstimator(model), threshold=combined_fair_predictor.threshold
+        )
+        for model in ensemble_models
+    ]
 
     end_time = time.perf_counter()
     training_time = end_time - start_time
@@ -295,8 +304,8 @@ def train_ensemble(
     # Get predictions from all ensemble members
     ensemble_preds = []
     test_predictions_data = {"data": test_data["data"], "target": test_data["target"]}
-    for model in ensemble_models:
-        preds = model.predict(test_predictions_data)
+    for model in frozen_ensemble:
+        preds = model.predict(test_predictions_data["data"])
         ensemble_preds.append(preds)
 
     # Calculate ensemble metrics
@@ -307,11 +316,6 @@ def train_ensemble(
         test_groups=test_data["groups"],
         test_labels=test_data["target"],
         predictions=final_preds,
-    )
-
-    individual_test_metrics = fair_predictor.evaluate_fairness(
-        data=test_data,
-        metrics=gm.default_fairness_measures | {"min_recall": gm.recall.min},
     )
 
     ensemble_test_metrics["model_type"] = "ensemble"
@@ -334,8 +338,8 @@ def train_ensemble(
         ensemble_test_metrics[f"der_group_{group}"] = der_value
 
     # Evaluate individual models on test set for comparison
-    for member, model in enumerate(ensemble_models):
-        indiv_preds = model.predict(test_predictions_data)
+    for member, model in enumerate(frozen_ensemble):
+        indiv_preds = model.predict(test_predictions_data["data"])
         indiv_metrics = calculate_metrics(
             test_groups=test_data["groups"],
             test_labels=test_data["target"],
@@ -346,7 +350,7 @@ def train_ensemble(
         indiv_metrics["model_type"] = "individual"
         individual_metrics.append(indiv_metrics)
 
-    return ensemble_test_metrics, individual_metrics, ensemble_models
+    return ensemble_test_metrics, individual_metrics, frozen_ensemble
 
 
 def merge_ethnicity_groups(data, groups_to_merge, merge_name=" Other"):
@@ -369,7 +373,9 @@ def main(
     output_dir.mkdir(exist_ok=True)
 
     # Load adult dataset with ethnicity as sensitive attribute
-    logger.info("Loading Adult dataset with ethnicity as sensitive attribute")
+    logger.info(
+        f"Loading {dataset.capitalize()} dataset with ethnicity as sensitive attribute"
+    )
 
     replacement_groups = (
         {
@@ -433,12 +439,8 @@ def main(
             index=False,
         )
 
-        test_predictions_data = {
-            "data": test_data["data"],
-            "target": test_data["target"],
-        }
         probas = [
-            ensemble_model.predict_proba(test_predictions_data)[:, 1]
+            ensemble_model.predict_proba(test_data["data"])[:, 1]
             for ensemble_model in ensemble_models
         ]
         prediction_thresholds = np.linspace(0, 1, 100)
