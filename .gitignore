@@ -1,6 +1,7 @@
 # Local models
 multilabel_model/
 catboost_info/
+saved_models/
 # Local data
 hatespeech-data/
 profile_output*

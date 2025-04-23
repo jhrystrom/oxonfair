@@ -1,17 +1,43 @@
+import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 from sklearn.model_selection import train_test_split
+
+
+def read_meta(datapath: Path) -> pd.DataFrame:
+    columns = [
+        "ID",
+        "Age",
+        "Gender",
+        "Diagnosis",
+        "dioptre_1",
+        "dioptre_2",
+        "astigmatism",
+        "Phakic_Pseudophakic",
+        "Pneumatic",
+        "Perkins",
+        "Pachymetry",
+        "Axial_Length",
+        "VF_MD",
+    ]
+    meta = pd.read_excel(datapath, header=None, skiprows=3)
+    meta.columns = columns
+    return meta
 
 
 def main():
     # read metadata
-    path = Path("your_path/data/PAPILA/")
+    load_dotenv(override=True)
+    path = Path(os.getenv("PAPILA_PATH"))
+    assert path.exists(), f"Path {path} does not exist"
 
     # OD for right, OS for left
-    od_meta = pd.read_csv(path / "ClinicalData/patient_data_od.csv")
-    os_meta = pd.read_csv(path / "ClinicalData/patient_data_os.csv")
+    od_path = path / "ClinicalData/patient_data_od.xlsx"
+    od_meta = read_meta(od_path)
+    os_meta = read_meta(path / "ClinicalData/patient_data_os.xlsx")
 
     # Create path columns for each eye dataset
     ids = os_meta["ID"].values
