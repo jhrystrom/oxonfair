@@ -1,7 +1,6 @@
 import argparse
 import copy
 from dataclasses import dataclass
-from datetime import datetime
 from functools import lru_cache
 from itertools import combinations
 from pathlib import Path
@@ -175,16 +174,24 @@ def calculate_der(preds: list[list[bool]], y_true: list[bool]) -> float:
 
 
 def calculate_der_groups(
-    preds: list[list[bool]], y_true: list[bool], groups: list[bool]
+    preds: list[list[bool]],
+    y_true: list[bool],
+    groups: list[bool],
+    is_recall: bool = False,
 ) -> tuple[float, float]:
     group_mask = np.array(groups)
     ders = [0, 0]
     for group in range(2):
         mask_variable = group_mask == group
-        y_true_group = np.array(y_true)[mask_variable]
+        if is_recall:
+            logger.debug("Only calculating positive (recall)")
+            mask_variable = mask_variable & np.array(y_true)
+        y_true_group = np.array(y_true)[mask_variable == 1]
         group_indices = np.where(mask_variable)[0]
         group_preds = [pred for i, pred in enumerate(preds) if i in group_indices]
-        assert len(group_preds) == y_true_group.shape[0]
+        assert (
+            len(group_preds) == y_true_group.shape[0]
+        ), f"{len(group_preds)=} != {y_true_group.shape[0]=}"
         group_der = calculate_der(preds=group_preds, y_true=y_true_group)
         ders[group] += group_der
     return ders[0], ders[1]
@@ -324,7 +331,7 @@ def compute_loss_func(
     return loss
 
 
-combined = get_full_data().sample(fraction=0.2)
+combined = get_full_data()  # .sample(fraction=0.2)
 
 # 5. Prepare data collator
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
@@ -436,7 +443,6 @@ def train(metric: str, num_iterations: int = 1, members: int = 3):
                 .reset_index()
                 .assign(classifier=i, metric_type="performance")
             )
-            logger.debug({f"{group_performance.head()=}"})
             group_metrics.append(group_performance)
             metrics.append(pd.concat([performance, fairness]))
             fair_ensemble.append(fair_network)
@@ -469,13 +475,26 @@ def train(metric: str, num_iterations: int = 1, members: int = 3):
         ensemble_der_total = calculate_der(
             preds=formatted_preds, y_true=test_labels.to_list()
         )
+
         der0, der1 = calculate_der_groups(
             preds=formatted_preds,
             y_true=test_labels.to_list(),
             groups=test_features["gender"].to_list(),
+            is_recall=True,
         )
+
+        der0complete, der1complete = calculate_der_groups(
+            preds=formatted_preds,
+            y_true=test_labels.to_list(),
+            groups=test_features["gender"].to_list(),
+            is_recall=False,
+        )
+
         logger.info(f"{ensemble_der_total=}")
+        logger.info("DER for true cases:")
         logger.info(f"{der0=} and {der1=}")
+        logger.info("DER for all cases:")
+        logger.info(f"{der0complete=} and {der1complete=}")
 
         ensemble_preds = aggregate_scores(raw_preds)
 
