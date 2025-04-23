@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.2.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oxonfair"
+dynamic = ["optional-dependencies",'license','classifiers','version','authors','dependencies','readme','description','requires-python'] 
+
+[project.urls]
+Homepage =  "https://github.com/ChrisMRuss/oxon-fair/"
+Issues = "https://github.com/ChrisMRuss/oxon-fair/issues"
+
+[dependency-groups]
+full = [
+    "accelerate>=1.6.0",
+    "evaluate>=0.4.3",
+    "matplotlib>=3.10.1",
+    "polars>=1.26.0",
+    "torch>=2.6.0",
+    "transformers>=4.50.3",
+]
+notebook = [
+    "ipykernel>=6.29.5",
+]
+plot = [
+    "seaborn>=0.13.2",
+]
