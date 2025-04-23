@@ -472,8 +472,9 @@ def main(
         indiv_df = pd.DataFrame(individual_metrics)
         indiv_df["dataset"] = dataset
         indiv_df["iteration"] = iteration
-        indiv_df.to_csv(
-            output_dir / f"individual_metrics-{dataset}-n{members}-i{iteration}.csv",
+        indiv_df.assign(fairness_metric=metric).to_csv(
+            output_dir
+            / f"individual_metrics-{dataset}-n{members}-i{iteration}-metric_{metric}.csv",
             index=False,
         )
 
@@ -504,18 +505,21 @@ def main(
             metrics["iteration"] = iteration
             single_metrics.append(metrics)
     pd.DataFrame(single_metrics).to_csv(
-        output_dir / f"single_threshold_metrics_{dataset}-n{members}-i{iterations}.csv",
+        output_dir
+        / f"single_threshold_metrics_{dataset}-n{members}-i{iterations}-metric_{metric}.csv",
         index=False,
     )
     pd.DataFrame(all_metrics).to_csv(
-        output_dir / f"threshold_metrics_{dataset}-n{members}-i{iterations}.csv",
+        output_dir
+        / f"threshold_metrics_{dataset}-n{members}-i{iterations}-metric_{metric}.csv",
         index=False,
     )
 
     # Save overall results
-    results_df = pd.DataFrame(results)
+    results_df = pd.DataFrame(results).assign(fairness_metric=metric)
     results_df.to_csv(
-        output_dir / f"ensemble_results-{dataset}-n{members}-i{iterations}.csv",
+        output_dir
+        / f"ensemble_results-{dataset}-n{members}-i{iterations}-metric_{metric}.csv",
         index=False,
     )
 
