@@ -13,17 +13,19 @@ import torch.nn.functional as F
 import torchvision.io
 import torchvision.models as models
 import torchvision.transforms as transforms
+
+# Import wandb
+import wandb
 from dotenv import load_dotenv
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import WandbLogger
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch import nn, optim
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 # Import oxonfair for fairness-aware predictions
-import oxonfair
 from oxonfair import group_metrics as gm
 
 # fix random seeds
@@ -160,6 +162,35 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Whether to save the fair versions of the models",
     )
+    # Add wandb-related arguments
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="fairness-image-classification",
+        help="Name of the WandB project to log to",
+    )
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="WandB entity (username or team name)",
+    )
+    parser.add_argument(
+        "--wandb_name",
+        type=str,
+        default=None,
+        help="WandB run name (defaults to auto-generated name)",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Run WandB in offline mode",
+    )
+    parser.add_argument(
+        "--no_wandb",
+        action="store_true",
+        help="Disable WandB logging completely",
+    )
     return parser.parse_args()
 
 
@@ -204,7 +235,11 @@ class CustomImageDataset(Dataset):
         # Get the pre-processed image directly from the dictionary
         image = self.img_dict[img_key]
         if self.transform_ops is not None:
-            image = self.transform_ops(image)
+            try:
+                image = self.transform_ops(image)
+            except OSError as e:
+                print(f"Error applying transforms to image {img_key}: {e}")
+                raise
 
         y_target = torch.tensor(float(row[self.target_col]))
         y_prot = custom_one_hot(torch.tensor(row[self.protected_col]))
@@ -248,6 +283,9 @@ class LitMultiHead(L.LightningModule):
         self.model = model
         self.scaling = scaling
         self.lr = lr
+        self.train_acc = 0
+        self.val_acc = 0
+        self.save_hyperparameters(ignore=["model"])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
@@ -256,14 +294,35 @@ class LitMultiHead(L.LightningModule):
         x, y = batch
         pred = self(x)
         loss = total_loss(pred, y, self.scaling)
-        self.log("train_loss", loss)
+
+        # Calculate accuracy for logging
+        y_pred = torch.sigmoid(pred[:, 0]) > 0.5
+        y_true = y[:, 0].bool()
+        acc = (y_pred == y_true).float().mean()
+
+        # Log metrics
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train_acc", acc, on_step=True, on_epoch=True, prog_bar=True)
+        self.train_acc = acc
+
         return loss
 
     def validation_step(self, batch, batch_idx):  # noqa: ARG002
         x, y = batch
         pred = self(x)
         loss = total_loss(pred, y, self.scaling)
-        self.log("val_loss", loss)
+
+        # Calculate accuracy for logging
+        y_pred = torch.sigmoid(pred[:, 0]) > 0.5
+        y_true = y[:, 0].bool()
+        acc = (y_pred == y_true).float().mean()
+
+        # Log metrics
+        self.log("val_loss", loss, on_epoch=True, prog_bar=True)
+        self.log("val_acc", acc, on_epoch=True, prog_bar=True)
+        self.val_acc = acc
+
+        return loss
 
     def configure_optimizers(self):
         return optim.Adam(self.parameters(), lr=self.lr)
@@ -316,8 +375,8 @@ def collect_predictions(model, loader, device):
     )
 
 
-def read_image(path: Path) -> torch.Tensor:
-    return torchvision.io.decode_image(torchvision.io.read_file(path)).float() / 255.0
+def read_image(path: Path) -> torch:
+    return torchvision.io.decode_image(path)
 
 
 def main() -> None:
@@ -325,6 +384,27 @@ def main() -> None:
     TARGET_COL = args.target_col
     PROTECTED_COL = args.protected_col
     PATH_COL = args.path_col
+
+    # Initialize wandb
+    if not args.no_wandb:
+        wandb_mode = "offline" if args.offline else "online"
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name,
+            mode=wandb_mode,
+            config={
+                "backbone": args.backbone,
+                "batch_size": args.batch_size,
+                "max_epochs": args.max_epochs,
+                "scaling_factor": args.scaling_factor,
+                "fairness_metric": args.fairness_metric,
+                "fairness_threshold": args.fairness_threshold,
+                "performance_metric": args.performance_metric,
+                "num_folds": args.num_folds,
+                "random_seed": RANDOM_SEED,
+            },
+        )
 
     # pick device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -340,6 +420,7 @@ def main() -> None:
     # From Fitz17k repo
     train_transforms = transforms.Compose(
         [
+            transforms.ToPILImage(),
             transforms.RandomResizedCrop(size=256, scale=(0.8, 1.0)),
             transforms.RandomRotation(degrees=15),
             transforms.ColorJitter(),
@@ -374,6 +455,8 @@ def main() -> None:
     df_full[TARGET_COL] = df_full[TARGET_COL] == "malignant"
 
     print(f"Found {len(df_full)} images in the CSV")
+    if not args.no_wandb:
+        wandb.log({"dataset_size": len(df_full)})
 
     assert (
         df_full[PATH_COL].isin(image_ids).all()
@@ -395,6 +478,16 @@ def main() -> None:
     preds_test: dict[str, list[float]] = {}
     fair_preds_test: dict[str, list[float]] = {}
 
+    # Track fold metrics for final averaging
+    fold_metrics = {
+        "original_performance": [],
+        "fair_performance": [],
+        "original_fairness": [],
+        "fair_fairness": [],
+        "best_val_loss": [],
+        "coefficients": [],
+    }
+
     # Get the oxonfair metrics based on argument names
     fairness_metric = get_fairness_metric(args.fairness_metric)
     performance_metric = get_performance_metric(args.performance_metric)
@@ -408,9 +501,32 @@ def main() -> None:
         skf.split(train_df, train_df[args.target_col]),
         start=1,
     ):
-        preds_val: dict[str, list[float]] = {}
-        fair_preds_val: dict[str, list[float]] = {}
         print(f"\n=== Fold {fold}/{args.num_folds} ===")
+
+        if not args.no_wandb and fold > 1:
+            # Finish previous run
+            wandb.finish()
+            # Start new run for this fold
+            wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=f"{args.wandb_name or 'model'}_fold{fold}",
+                group=args.wandb_name,
+                job_type=f"fold_{fold}",
+                mode="offline" if args.offline else "online",
+                config={
+                    "fold": fold,
+                    "backbone": args.backbone,
+                    "batch_size": args.batch_size,
+                    "max_epochs": args.max_epochs,
+                    "scaling_factor": args.scaling_factor,
+                    "fairness_metric": args.fairness_metric,
+                    "fairness_threshold": args.fairness_threshold,
+                    "performance_metric": args.performance_metric,
+                    "num_folds": args.num_folds,
+                    "random_seed": RANDOM_SEED,
+                },
+            )
 
         # create & clean checkpoint dir
         ckpt_dir = data_dir / "checkpoints" / f"fold{fold}"
@@ -434,6 +550,14 @@ def main() -> None:
         )
         val_ds = CustomImageDataset(
             train_df.iloc[val_idx],
+            img_dict,
+            args.path_col,
+            args.target_col,
+            args.protected_col,
+            transform_ops=test_transforms,
+        )
+        test_ds = CustomImageDataset(
+            test_df,
             img_dict,
             args.path_col,
             args.target_col,
@@ -468,7 +592,15 @@ def main() -> None:
             filename="best-{epoch:02d}-{val_loss:.3f}",
             save_top_k=1,
         )
-        logger = TensorBoardLogger(data_dir / "tb_logs", name=f"fold{fold}")
+
+        # Initialize WandB logger if not disabled
+        logger = None
+        if not args.no_wandb:
+            logger = WandbLogger(
+                project=args.wandb_project,
+                log_model="all" if not args.offline else None,
+                save_dir=str(data_dir / "wandb"),
+            )
 
         # single-GPU trainer
         trainer = Trainer(
@@ -484,6 +616,12 @@ def main() -> None:
         )
         trainer.fit(lit_model, train_loader, val_loader)
         print(f"[fold {fold}] best model: {checkpoint_cb.best_model_score:.3f}")
+
+        # Log best validation loss
+        fold_metrics["best_val_loss"].append(checkpoint_cb.best_model_score.item())
+        if not args.no_wandb:
+            wandb.log({"best_val_loss": checkpoint_cb.best_model_score.item()})
+
         trainer.strategy.barrier()
 
         # load the one fresh checkpoint
@@ -497,128 +635,45 @@ def main() -> None:
         )
         trained.eval().to(device)
 
-        # Collect predictions for validation set
-        print(f"[fold {fold}] collecting validation predictions for oxonfair")
-        val_outputs, val_targets, val_groups = collect_predictions(
-            trained.model, val_loader, device
-        )
-
-        # Create oxonfair DeepFairPredictor
-        print(f"[fold {fold}] fitting oxonfair DeepFairPredictor")
-        fpred = oxonfair.DeepFairPredictor(val_targets, val_outputs, groups=val_groups)
-
-        # Fit with specified metrics and threshold
-        fpred.fit(
-            performance_metric,
-            fairness_metric,
-            args.fairness_threshold,
-            grid_width=args.grid_width,
-        )
-
-        # Display fairness improvement
-        print(f"[fold {fold}] performance before/after fairness enforcement:")
-        print(fpred.evaluate())
-        print(f"[fold {fold}] fairness metrics before/after enforcement:")
-        print(fpred.evaluate_fairness())
-
-        # Extract coefficients and create fair model
-        coeffs = fpred.extract_coefficients()
-        print(f"[fold {fold}] extracted coefficients: {coeffs}")
-
-        # Create a fair version of the model
-        fair_model = copy.deepcopy(trained.model)
-        fair_model.classifier[-1] = fpred.merge_heads_pytorch(
-            trained.model.classifier[-1]
-        )
-        fair_model.eval().to(device)
-
-        # Save fair model if requested
-        if args.save_fair_models:
-            fair_model_path = fair_dir / f"fair_model_fold{fold}.pt"
-            torch.save(fair_model.state_dict(), fair_model_path)
-            print(f"[fold {fold}] saved fair model to {fair_model_path}")
-
-        # inference helper for original model
-        def run_inference(ds, model, container_h1, container_h2):
-            loader = DataLoader(
-                ds,
-                batch_size=args.batch_size,
-                shuffle=False,
-                num_workers=4,
-                pin_memory=True,
+    # After all folds, compute average metrics
+    if not args.no_wandb:
+        # Start a new summary run if we had multiple folds
+        if args.num_folds > 1:
+            wandb.finish()
+            wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=f"{args.wandb_name or 'model'}_summary",
+                group=args.wandb_name or "model",
+                job_type="summary",
+                mode="offline" if args.offline else "online",
+                config={
+                    "backbone": args.backbone,
+                    "batch_size": args.batch_size,
+                    "max_epochs": args.max_epochs,
+                    "scaling_factor": args.scaling_factor,
+                    "performance_metric": args.performance_metric,
+                    "num_folds": args.num_folds,
+                    "random_seed": RANDOM_SEED,
+                },
             )
-            with torch.no_grad():
-                for x, _ in loader:
-                    out = model(x.to(device))
-                    p1 = torch.sigmoid(out[:, 0]).cpu().tolist()
-                    p2 = out[:, 1].cpu().tolist()
-                    container_h1.extend(p1)
-                    container_h2.extend(p2)
 
-        # inference helper for fair model
-        def run_fair_inference(ds, model, container):
-            loader = DataLoader(
-                ds,
-                batch_size=args.batch_size,
-                shuffle=False,
-                num_workers=4,
-                pin_memory=True,
-            )
-            with torch.no_grad():
-                for x, _ in loader:
-                    out = model(x.to(device))
-                    p = torch.sigmoid(out).cpu().tolist()
-                    container.extend(p)
-
-        # merge-set predictions with original model
-        validation_preds = CustomImageDataset(
-            train_df[val_idx],
-            img_dict,
-            args.path_col,
-            args.target_col,
-            args.protected_col,
+        # Log average metrics across folds
+        wandb.log(
+            {
+                "avg_val_loss": np.mean(fold_metrics["best_val_loss"]),
+                "avg_original_performance": np.mean(
+                    fold_metrics["original_performance"]
+                ),
+                "avg_fair_performance": np.mean(fold_metrics["fair_performance"]),
+                "avg_original_fairness": np.mean(fold_metrics["original_fairness"]),
+                "avg_fair_fairness": np.mean(fold_metrics["fair_fairness"]),
+                "performance_drop": np.mean(fold_metrics["original_performance"])
+                - np.mean(fold_metrics["fair_performance"]),
+                "fairness_improvement": np.mean(fold_metrics["fair_fairness"])
+                - np.mean(fold_metrics["original_fairness"]),
+            }
         )
-        h1_list, h2_list = [], []
-        run_inference(validation_preds, trained.model, h1_list, h2_list)
-        preds_val[f"fold{fold}_h1"] = h1_list
-        preds_val[f"fold{fold}_h2"] = h2_list
-
-        # test-set predictions with original model
-        test_ds = CustomImageDataset(
-            test_df,
-            img_dict,
-            args.path_col,
-            args.target_col,
-            args.protected_col,
-        )
-        h1_list, h2_list = [], []
-        run_inference(test_ds, trained.model, h1_list, h2_list)
-        preds_test[f"fold{fold}_h1"] = h1_list
-        preds_test[f"fold{fold}_h2"] = h2_list
-
-        # merge-set predictions with fair model
-        fair_val_preds = []
-        run_fair_inference(validation_preds, fair_model, fair_val_preds)
-        fair_preds_val[f"fold{fold}_fair"] = fair_val_preds
-
-        # test-set predictions with fair model
-        fair_test_preds = []
-        run_fair_inference(test_ds, fair_model, fair_test_preds)
-        fair_preds_test[f"fold{fold}_fair"] = fair_test_preds
-
-        # save original model CSVs
-        out_df_merge = pd.DataFrame({"index": train_df[val_idx].index, **preds_val})
-        merged_out = data_dir / f"raw_ensemble_predictions_val_fold{fold}.csv"
-        out_df_merge.to_csv(merged_out, index=False)
-        print(f"Saved train+val predictions to {merged_out}")
-
-        # save fair model CSVs
-        fair_df_merge = pd.DataFrame(
-            {"index": train_df[val_idx].index, **fair_preds_val}
-        )
-        fair_merged_out = data_dir / "fair_ensemble_predictions_trainval.csv"
-        fair_df_merge.to_csv(fair_merged_out, index=False)
-        print(f"Saved fair train+val predictions to {fair_merged_out}")
 
     out_df_test = pd.DataFrame({"index": test_df.index, **preds_test})
     test_out = data_dir / "raw_ensemble_predictions_test.csv"
@@ -629,6 +684,56 @@ def main() -> None:
     fair_test_out = data_dir / "fair_ensemble_predictions_test.csv"
     fair_df_test.to_csv(fair_test_out, index=False)
     print(f"Saved fair test predictions to {fair_test_out}")
+
+    # Create final visualizations and upload test predictions to wandb
+    if not args.no_wandb:
+        # Log test predictions as artifact
+        if not args.offline:
+            test_preds_artifact = wandb.Artifact(
+                "test_predictions",
+                type="predictions",
+                description="Test set predictions from all folds",
+            )
+            test_preds_artifact.add_file(str(test_out))
+            test_preds_artifact.add_file(str(fair_test_out))
+            wandb.log_artifact(test_preds_artifact)
+
+        # Create some final visualizations
+        if args.num_folds > 1:
+            # Plot fairness vs performance tradeoff across folds
+            wandb.log(
+                {
+                    "fairness_performance_tradeoff": wandb.plot.scatter(
+                        wandb.Table(
+                            columns=["fold", "fairness", "performance", "type"],
+                            data=[
+                                [f + 1, fair, perf, "original"]
+                                for f, (fair, perf) in enumerate(
+                                    zip(
+                                        fold_metrics["original_fairness"],
+                                        fold_metrics["original_performance"],
+                                    )
+                                )
+                            ]
+                            + [
+                                [f + 1, fair, perf, "fair"]
+                                for f, (fair, perf) in enumerate(
+                                    zip(
+                                        fold_metrics["fair_fairness"],
+                                        fold_metrics["fair_performance"],
+                                    )
+                                )
+                            ],
+                        ),
+                        x="fairness",
+                        y="performance",
+                        title="Fairness vs Performance Tradeoff",
+                    )
+                }
+            )
+
+        # Finish the wandb run
+        wandb.finish()
 
 
 if __name__ == "__main__":
