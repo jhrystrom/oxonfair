@@ -249,18 +249,24 @@ class CustomImageDataset(Dataset):
         return image, labels
 
 
-def get_backbone(name: str) -> nn.Module:
+def get_backbone(name: str, num_heads: int = 4) -> nn.Module:
     if name == "mobilenetv3":
         m = models.mobilenet_v3_small(
             weights=models.MobileNet_V3_Small_Weights.IMAGENET1K_V1
         )
-        m.classifier[3] = nn.Linear(1024, 2)
+        for param in m.parameters():
+            param.requires_grad = False
+        m.classifier[3] = nn.Linear(1024, num_heads)
     elif name == "resnet18":
         m = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-        m.fc = nn.Linear(m.fc.in_features, 2)
+        for param in m.parameters():
+            param.requires_grad = False
+        m.fc = nn.Linear(m.fc.in_features, num_heads)
     elif name == "resnet50":
         m = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
-        m.fc = nn.Linear(m.fc.in_features, 2)
+        for param in m.parameters():
+            param.requires_grad = False
+        m.fc = nn.Linear(m.fc.in_features, num_heads)
     else:
         raise ValueError(f"Unknown backbone: {name}")
     return m
@@ -325,7 +331,9 @@ class LitMultiHead(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        return optim.Adam(self.parameters(), lr=self.lr)
+        return optim.Adam(
+            filter(lambda p: p.requires_grad, self.parameters()), lr=self.lr
+        )
 
 
 def get_fairness_metric(name: str):
@@ -453,6 +461,7 @@ def main() -> None:
         (df_full[PROTECTED_COL] != -1) & df_full[PATH_COL].isin(image_ids)
     ]
     df_full[TARGET_COL] = df_full[TARGET_COL] == "malignant"
+    df_full.to_csv(data_dir / "fitzpatrick17k_cleaned.csv", index=False)
 
     print(f"Found {len(df_full)} images in the CSV")
     if not args.no_wandb:
@@ -464,7 +473,10 @@ def main() -> None:
     img_dict = {path.stem: read_image(path) for path in tqdm(image_paths)}
 
     train_df, test_df = train_test_split(
-        df_full, stratify=df_full[args.target_col], test_size=0.2
+        df_full,
+        stratify=df_full[args.target_col],
+        test_size=0.2,
+        random_state=RANDOM_SEED,
     )
 
     # stratified K-fold
@@ -529,15 +541,10 @@ def main() -> None:
             )
 
         # create & clean checkpoint dir
-        ckpt_dir = data_dir / "checkpoints" / f"fold{fold}"
+        ckpt_dir = data_dir / "checkpoints" / "fitzpatrick" / f"fold{fold}"
         if ckpt_dir.exists():
             shutil.rmtree(ckpt_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-        # Create fair model directory if needed
-        fair_dir = data_dir / "fair_models"
-        if args.save_fair_models:
-            fair_dir.mkdir(parents=True, exist_ok=True)
 
         # data loaders
         train_ds = CustomImageDataset(
@@ -550,14 +557,6 @@ def main() -> None:
         )
         val_ds = CustomImageDataset(
             train_df.iloc[val_idx],
-            img_dict,
-            args.path_col,
-            args.target_col,
-            args.protected_col,
-            transform_ops=test_transforms,
-        )
-        test_ds = CustomImageDataset(
-            test_df,
             img_dict,
             args.path_col,
             args.target_col,

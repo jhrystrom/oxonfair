@@ -2,8 +2,9 @@
 multilabel_model/
 catboost_info/
 saved_models/
-# Local data
+# Local dataO
 hatespeech-data/
+**/wandb/
 profile_output*
 
 # Byte-compiled / optimized / DLL files
